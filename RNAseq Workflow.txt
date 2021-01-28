@@ -1,0 +1,172 @@
+#Installed and configured WSL2 Ubuntu onto windows 10
+
+#Installed sratoolkit.2.10.7-mac64 DMG from website
+wget "http://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-centos_linux64.tar.gz"
+tar -xzf sratoolkit.current-centos_linux64.tar.gz
+
+#Using prefetch command within bin folder to extract SRA files SRR9019705 and SRR9019706 from NCBI (YB1 - RIPseq illumina 2000)
+~/sratoolkit.2.10.8-ubuntu64/bin/prefetch SRR9019705 SRR9019706 SRR9019712 SRR9019713 SRR9019719 SRR9019720
+
+#Check whether sra is paired or single read 
+srr="SRR9019705"
+numLines=$(fastq-dump -X 1 -Z --split-spot $srr | wc -l)
+if [ $numLines -eq 4 ]
+then
+  echo "$srr is single-end"
+else
+  echo "$srr is paired-end"
+fi
+
+# Extract fastq files from sra files.
+# IMPORTANT: use --split-files to process paired-end 
+fastq-dump SRR3199419.sra -O fastq 		 	#Example of fastq-dump on SINGLE-END data
+fastq-dump SRR3199419.sra --split-files -O fastq 	#Example of fastq-dump on PAIRED-END data
+
+#Perform fastq conversion:
+~/sratoolkit.2.10.8-ubuntu64/bin/fastq-dump ~/SRR9019705/SRR9019705.sra ~/SRR9019706/SRR9019706.sra ~/SRR9019712/SRR9019712.sra ~/SRR9019713/SRR9019713.sra ~/SRR9019719/SRR9019719.sra ~/SRR9019720/SRR9019720.sra -O fastq
+
+
+
+####### Installing Trim Galore (Dependencies include FastQC and Cutadapt)
+# Check out Cutadapt website: https://cutadapt.readthedocs.io/en/stable/
+# Lots of ways to install: https://cutadapt.readthedocs.io/en/stable/installation.html#quick-installation
+
+#installing conda for WSL2
+sudo add-apt-repository ppa:jonathonf/python-3.6
+sudo apt update
+sudo apt install python3.6 python3-pip
+
+##Download using Conda for WSL2
+sudo apt install cutadapt
+
+### Get Trim Galore
+wget https://github.com/FelixKrueger/TrimGalore/archive/0.6.5.tar.gz
+tar -xvf 0.6.5.tar.gz
+
+#Run Trim galore
+~/TrimGalore-0.6.5/trim_galore -j 8 ~/fastq/SRR9019705.fastq ~/fastq/SRR9019706.fastq ~/fastq/SRR9019712.fastq ~/fastq/SRR9019713.fastq ~/fastq/SRR9019719.fastq ~/fastq/SRR9019720.fastq -o fastq.trimGalore
+
+Creates the following files:
+SRR9019705.fastq_trimming_report.txt
+SRR9019705_1_trimmed.fq
+
+#gzip the fq files and prepare to run STAR
+SRR9019719_1_trimmed.fq.gz
+
+
+#FOR AMAZON SSH: Must use VPN
+ssh -i ./lfm.pem ec2-user@10.65.70.132
+#make sure you copy .trimmed.fq files from ubuntu to AWS. Trim files locally then move. 
+scp -i ~/lfm.pem -r ~/fastq ec2-user@10.65.70.132:~/
+
+Copy local fastq files to server: 
+scp -r ~/lfm.pem ~/fastq.trimGalore ec2-user@10.65.70.132:~/
+#Need to be in the directory that the file is in for it to transfer
+#Make sure they are .gz (gzip) or the transfer will take a long time
+
+### Install STAR aligner
+# Download STAR
+git clone https://github.com/alexdobin/STAR.git
+
+# build from source
+cd STAR/source
+make STAR
+
+# Add Trim Galore PATH so that the command is recognized. This is OS dependent and your PATH will be different. In Linux you can add to your .profile using the following line
+export PATH=$PATH:/media/bbarwick/RAID/tools/STAR/STAR/bin/Linux_x86_64
+#You may need to refresh your profile. In Linux it is something like 
+source ~/.profile
+
+### Downloading Reference genomes and annotation files - these must come from the same institutation because of chromosomal naming conventions (both were taken from ensemble GRCh38.96)
+###MUST HAVE AT LEAST 100GB FREE SPACE FOR THIS - WILL RECEIVE std::bad_alloc IF NOT ENOUGH SPACE
+
+
+wget ftp://ftp.ensembl.org/pub/release-96/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+wget ftp://ftp.ensembl.org/pub/release-96/gtf/homo_sapiens/Homo_sapiens.GRCh38.96.gtf.gz
+
+
+#Takes a long time don't forget to do tmux - need 64gb ram if you are including the annotations
+~/STAR/bin/Linux_x86_64/STAR \
+--runThreadN 32 \
+--runMode genomeGenerate \
+--genomeDir ~/STAR/genome \
+--genomeChrBinNbits=14 \
+--genomeSAsparseD 2 \
+--genomeFastaFiles ~/STAR/genome/Homo_sapiens.GRCh38.dna.primary_assembly.fa 
+
+
+
+### Aligning sequence to the reference genome
+# check out ENCODE standards: https://www.encodeproject.org/pipelines/ENCPL002LPE/
+
+#Make directory for alignment output 
+mkdir ~/alignments
+
+#Write bash script in nano for STAR auto-alignment 
+nano auto_STAR
+
+----------------------------
+for i in *.fastq
+do
+~/STAR/bin/Linux_x86_64/STAR --runThreadN 32 \
+--genomeDir ~/STAR/genome/ \
+--sjdbGTFfile ~/STAR/genome/Homo_sapiens.GRCh38.96.gtf \
+--quantMode GeneCounts \
+--outFilterType BySJout \
+--outFilterMultimapNmax 20 \
+--alignSJoverhangMin 8 \
+--alignSJDBoverhangMin 1 \
+--outFilterMismatchNmax 999 \
+--outFilterMismatchNoverReadLmax 0.04 \
+--alignIntronMin 20 \
+--alignIntronMax 1000000 \
+--alignMatesGapMax 1000000 \
+--readFilesIn ~/fastq.trimGalore/$i \
+--outFileNamePrefix ~/$i \
+--genomeChrBinNbits 12
+
+done
+----------------------------
+
+#Move to directory with Fastq files 
+cd fastq
+
+#run alignment loop
+bash auto_STAR
+
+#copy files to local machine
+scp -i ~/lfm.pem ec2-user@10.65.70.132:~/STAR/alignments/SRR19.Aligned.sortedByCoord.out.bam ~/
+
+#Files to transfer
+SRR05.ReadsPerGene.out.tab.gz
+SRR06.ReadsPerGene.out.tab.gz
+SRR12.ReadsPerGene.out.tab.gz
+SRR13.ReadsPerGene.out.tab.gz
+SRR19.ReadsPerGene.out.tab.gz
+SRR20.ReadsPerGene.out.tab.gz
+
+###Switching to R 
+
+---------------- END
+#tmux commands
+tmux new #to create the session
+ctrl+b d #to leave the session
+tmux attach-session -t <session_number> #to reenter the session
+
+#file deletion commands
+
+
+#Removing files that start with character string: 
+find  . -name 'SA*' -exec rm {} \;
+
+#Removing directories that start with character string: 
+find ~/ -type d -name 'SRR*' -delete
+
+
+
+
+
+
+
+
+
